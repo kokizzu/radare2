@@ -1777,7 +1777,7 @@ static int cmd_an2(RCore *core, const char *name, int mode) {
 	ut64 tgt_addr = op.jump != UT64_MAX? op.jump: op.ptr;
 	if (var) {
 		if (name) {
-			ret = r_anal_var_rename (var, name, true) ? 0 : -1;
+			ret = r_anal_var_rename (core->anal, var, name) ? 0 : -1;
 		} else if (mode == '*') {
 			r_cons_printf (core->cons, "f %s=0x%" PFMT64x "\n", var->name, tgt_addr);
 		} else if (mode == 'j') {
@@ -2088,7 +2088,7 @@ static int cmd_afv(RCore *core, const char *str) {
 			if (fcn) {
 				v1 = r_anal_function_get_var_byname (fcn, old_name);
 				if (v1) {
-					r_anal_var_rename (v1, new_name, true);
+					r_anal_var_rename (core->anal, v1, new_name);
 				} else {
 					R_LOG_ERROR ("Cant find var by name");
 				}
@@ -2167,7 +2167,7 @@ static int cmd_afv(RCore *core, const char *str) {
 				return false;
 			}
 			if (type) {
-				r_anal_var_set_type (v1, type);
+				r_anal_var_set_type (core->anal, v1, type);
 			} else {
 				r_cons_printf (core->cons, "%s\n", v1->type);
 			}
@@ -2233,7 +2233,7 @@ static int cmd_afv(RCore *core, const char *str) {
 				}
 			}
 			if (var) {
-				r_anal_var_delete (var);
+				r_anal_var_delete (core->anal, var);
 			}
 		}
 		break;
@@ -2262,7 +2262,7 @@ static int cmd_afv(RCore *core, const char *str) {
 			int ptr = *var->type == 's' ? idx - fcn->maxstack : idx;
 			RAnalOp *op = r_core_anal_op (core, addr, 0);
 			const char *ireg = op ? op->ireg : NULL;
-			r_anal_var_set_access (var, ireg, addr, rw, ptr);
+			r_anal_var_set_access (core->anal, var, ireg, addr, rw, ptr);
 			r_anal_op_free (op);
 		} else {
 			R_LOG_ERROR ("Missing argument");
@@ -4541,14 +4541,81 @@ static void cmd_afsr(RCore *core, const char *input) {
 	}
 }
 
+static void printfcnjson(RCore *core, RAnalFunction *fcn) {
+	RAnal *a = fcn->anal;
+	PJ *pj = a->coreb.pjWithEncoding (core);
+	const char *realname = NULL, *import_substring = NULL;
+
+	RFlagItem *flag = a->flag_get (a->flb.f, false, fcn->addr);
+	// Can't access R_FLAGS_FS_IMPORTS, since it is defined in r_core.h
+	if (flag && flag->space && !strcmp (flag->space->name, "imports")) {
+		// Get substring after last dot
+		import_substring = r_str_rchr (fcn->name, NULL, '.');
+		if (import_substring) {
+			realname = import_substring + 1;
+		}
+	} else {
+		realname = fcn->name;
+	}
+
+	char *args = strdup ("");
+	char *sdb_ret = r_str_newf ("func.%s.ret", realname);
+	char *sdb_args = r_str_newf ("func.%s.args", realname);
+	// RList *args_list = r_list_newf ((RListFree) free);
+	unsigned int i;
+	const char *ret_type = sdb_const_get (a->sdb_types, sdb_ret, 0);
+	const char *argc_str = sdb_const_get (a->sdb_types, sdb_args, 0);
+
+	int argc = argc_str? atoi (argc_str): 0;
+
+	pj_o (pj);
+	pj_ks (pj, "name", fcn->name);
+	const bool no_return = r_anal_noreturn_at_addr (a, fcn->addr);
+	pj_kb (pj, "noreturn", no_return);
+	pj_ks (pj, "ret", r_str_get_fail (ret_type, "void"));
+	if (fcn->callconv) {
+		pj_ks (pj, "callconv", fcn->callconv);
+	}
+	pj_kn (pj, "argc", argc);
+	pj_k (pj, "args");
+	pj_a (pj);
+	for (i = 0; i < argc; i++) {
+		char *sdb_arg_i = r_str_newf ("func.%s.arg.%d", realname, i);
+		char *arg_i = sdb_get (a->sdb_types, sdb_arg_i, 0);
+		if (!arg_i) {
+			continue;
+		}
+		pj_o (pj);
+		char *comma = strchr (arg_i, ',');
+		if (comma) {
+			*comma = 0;
+			pj_ks (pj, "name", comma + 1);
+			pj_ks (pj, "type", arg_i);
+			const char *rn = r_reg_alias_getname (a->reg, R_REG_ALIAS_A0 + i);
+			if (rn) {
+				pj_ks (pj, "cc", rn);
+			}
+		}
+		free (arg_i);
+		free (sdb_arg_i);
+		pj_end (pj);
+	}
+	pj_end (pj);
+	free (sdb_args);
+	free (sdb_ret);
+	free (args);
+	pj_end (pj);
+	char *s = pj_drain (pj);
+	r_cons_println (core->cons, s);
+	free (s);
+}
+
 static void cmd_afsj(RCore *core, const char *arg) {
 	ut64 a = r_num_math (core->num, arg);
 	const ut64 addr = a? a: core->addr;
 	RAnalFunction *f = r_anal_get_fcn_in (core->anal, addr, -1);
 	if (f) {
-		char *s = r_anal_function_get_json (f);
-		r_cons_println (core->cons, s);
-		free (s);
+		printfcnjson (core, f);
 	} else {
 		R_LOG_ERROR ("Cannot find function in 0x%08"PFMT64x, addr);
 	}
@@ -6441,7 +6508,9 @@ static int cmd_af(RCore *core, const char *input) {
 					// TODO: check if destination is outside the function boundaries
 				}
 			}
-		} else eprintf ("Cannot find function at 0x%08" PFMT64x "\n", core->addr);
+		} else {
+			R_LOG_ERROR ("Cannot find function at 0x%08" PFMT64x, core->addr);
+		}
 		free (name);
 		}
 		break;
